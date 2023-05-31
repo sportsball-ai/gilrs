@@ -165,7 +165,7 @@ impl Gamepad {
         *self.inner.uuid().as_bytes()
     }
 
-    /// Returns dev path or location id which represents the unique io location of the gamepad in Macos or Windows.
+    /// Returns dev path or location id which represents the unique io location of the gamepad in Linux and MacOS.
     /// Always None in other platforms.
     pub fn mount_point(&self) -> Option<String> {
         self.inner.mount_point()
