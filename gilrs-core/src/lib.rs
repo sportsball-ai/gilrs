@@ -29,7 +29,7 @@ impl FfDevice {
 }
 
 /// Holds information about gamepad event.
-#[derive(Copy, Clone, PartialEq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Event {
     /// Id of gamepad.
     pub id: usize,
@@ -47,7 +47,7 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Gamepad event.
 pub enum EventType {
     ButtonPressed(EvCode),
@@ -81,7 +81,7 @@ pub struct AxisInfo {
 ///     _ => (),
 /// };
 /// ```
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum PowerInfo {
     /// Failed to determine power status.
     Unknown,
@@ -116,7 +116,12 @@ impl Gilrs {
         self.inner.next_event()
     }
 
-    /// Borrows `Gamrpad` or return `None` if index is invalid. Returned gamepad may be disconnected.
+    /// Returns oldest event, waiting for new event if necessary.
+    pub fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
+        self.inner.next_event_blocking(timeout)
+    }
+
+    /// Borrows `Gamepad` or return `None` if index is invalid. Returned gamepad may be disconnected.
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
         unsafe {
             let gp: Option<&platform::Gamepad> = self.inner.gamepad(id);
@@ -169,6 +174,16 @@ impl Gamepad {
     /// Always None in other platforms.
     pub fn mount_point(&self) -> Option<String> {
         self.inner.mount_point()
+    }
+
+    /// Returns the vendor ID, as assigned by the USB-IF, when available.
+    pub fn vendor_id(&self) -> Option<u16> {
+        self.inner.vendor_id()
+    }
+
+    /// Returns the product ID, as assigned by the vendor, when available.
+    pub fn product_id(&self) -> Option<u16> {
+        self.inner.product_id()
     }
 
     /// Returns device's power supply state.

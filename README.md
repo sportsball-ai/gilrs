@@ -4,7 +4,7 @@ GilRs - Game Input Library for Rust
 [![pipeline status](https://gitlab.com/gilrs-project/gilrs/badges/master/pipeline.svg)](https://gitlab.com/gilrs-project/gilrs/commits/master)
 [![Crates.io](https://img.shields.io/crates/v/gilrs.svg)](https://crates.io/crates/gilrs)
 [![Documentation](https://docs.rs/gilrs/badge.svg)](https://docs.rs/gilrs/)
-[![Minimum rustc version](https://img.shields.io/badge/rustc-1.40.0+-yellow.svg)](https://gitlab.com/gilrs-project/gilrs)
+[![Minimum rustc version](https://img.shields.io/badge/rustc-1.65.0+-yellow.svg)](https://gitlab.com/gilrs-project/gilrs)
 
 [**Documentation (master)**](https://gilrs-project.gitlab.io/gilrs/doc/gilrs/)
 
@@ -33,7 +33,7 @@ Example
 
 ```toml
 [dependencies]
-gilrs = "0.8.1"
+gilrs = "0.10.3"
 ```
 
 ```rust
@@ -69,7 +69,7 @@ Supported features
 
 |                  | Input | Hotplugging | Force feedback |
 |------------------|:-----:|:-----------:|:--------------:|
-| Linux            |   ✓   |      ✓      |        ✓       |
+| Linux/BSD (evdev)|   ✓   |      ✓      |        ✓       |
 | Windows (XInput) |   ✓   |      ✓      |        ✓       |
 | OS X             |   ✓   |      ✓      |        ✕       |
 | Wasm             |   ✓   |      ✓      |       n/a      |
@@ -79,15 +79,16 @@ Supported features
 Platform specific notes
 ======================
 
-Linux
+Linux/BSD (evdev)
 -----
 
-On Linux, GilRs read (and write, in case of force feedback) directly from appropriate
+With evdev, GilRs read (and write, in case of force feedback) directly from appropriate
 `/dev/input/event*` file. This mean that user have to have read and write access to this file.
 On most distros it shouldn't be a problem, but if it is, you will have to create udev rule.
+On FreeBSD generic HID gamepads use hgame(4) and special use Linux driver via `webcamd`.
 
-To build GilRs, you will need pkg-config and libudev .pc file. On some
-distributions this file is packaged in separate archive (for example `libudev-dev` in Debian).
+To build GilRs, you will need pkg-config and libudev .pc file. On some distributions this file
+is packaged in separate archive (e.g., `libudev-dev` in Debian, `libudev-devd` in FreeBSD).
 
 Wasm
 ----
@@ -97,6 +98,8 @@ For stdweb, you will need [cargo-web](https://github.com/koute/cargo-web) to bui
 wasm32-unknown-unknown. For wasm-bindgen, you will need the wasm-bindgen cli or a tool like
 [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/).
 Unlike other platforms, events are only generated when you call `Gilrs::next_event()`.
+
+See [`./gilrs/examples/wasm/README.md`](./gilrs/examples/wasm/README.md) for running the examples using Wasm.
 
 License
 =======

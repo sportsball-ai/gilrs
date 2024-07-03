@@ -21,7 +21,7 @@
 
 pub use self::platform::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux"))]
 #[path = "linux/mod.rs"]
 mod platform;
 
@@ -29,8 +29,21 @@ mod platform;
 #[path = "macos/mod.rs"]
 mod platform;
 
-#[cfg(target_os = "windows")]
-#[path = "windows/mod.rs"]
+#[cfg(all(not(feature = "xinput"), not(feature = "wgi")))]
+compile_error!(
+    "Windows needs one of the features `gilrs/xinput` or `gilrs/wgi` enabled. \nEither don't use \
+     'default-features = false' or add one of the features back."
+);
+
+#[cfg(all(feature = "wgi", feature = "xinput"))]
+compile_error!("features `gilrs/xinput` and `gilrs/wgi` are mutually exclusive");
+
+#[cfg(all(target_os = "windows", feature = "xinput", not(feature = "wgi")))]
+#[path = "windows_xinput/mod.rs"]
+mod platform;
+
+#[cfg(all(target_os = "windows", feature = "wgi"))]
+#[path = "windows_wgi/mod.rs"]
 mod platform;
 
 #[cfg(target_arch = "wasm32")]
@@ -38,7 +51,7 @@ mod platform;
 mod platform;
 
 #[cfg(all(
-    not(target_os = "linux"),
+    not(any(target_os = "linux")),
     not(target_os = "macos"),
     not(target_os = "windows"),
     not(target_arch = "wasm32")

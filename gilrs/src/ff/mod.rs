@@ -50,7 +50,7 @@
 //! effect.play().unwrap();
 //! ```
 //!
-//! See [`examples/ff_pos.rs`](https://gitlab.com/gilrs-project/gilrs/blob/v0.8.1/examples/ff_pos.rs) for
+//! See [`examples/ff_pos.rs`](https://gitlab.com/gilrs-project/gilrs/blob/v0.10.3/examples/ff_pos.rs) for
 //! more advanced example.
 mod base_effect;
 mod effect_source;
@@ -339,8 +339,14 @@ impl EffectBuilder {
     }
 }
 
+impl Default for EffectBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Basic error type in force feedback module.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
     /// Force feedback is not supported by device with this ID

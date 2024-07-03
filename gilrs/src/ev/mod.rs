@@ -101,10 +101,12 @@ pub enum EventType {
     Disconnected,
     /// There was an `Event`, but it was dropped by one of filters. You should ignore it.
     Dropped,
+    /// A force feedback effect has ran for its duration and stopped.
+    ForceFeedbackEffectCompleted,
 }
 
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 /// Gamepad's elements which state can be represented by value from 0.0 to 1.0.
 ///
@@ -135,48 +137,37 @@ pub enum Button {
     DPadLeft = BTN_DPAD_LEFT,
     DPadRight = BTN_DPAD_RIGHT,
 
+    #[default]
     Unknown = BTN_UNKNOWN,
 }
 
 impl Button {
     pub fn is_action(self) -> bool {
         use crate::Button::*;
-        match self {
-            South | East | North | West | C | Z => true,
-            _ => false,
-        }
+        matches!(self, South | East | North | West | C | Z)
     }
 
     pub fn is_trigger(self) -> bool {
         use crate::Button::*;
-        match self {
-            LeftTrigger | LeftTrigger2 | RightTrigger | RightTrigger2 => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            LeftTrigger | LeftTrigger2 | RightTrigger | RightTrigger2
+        )
     }
 
     pub fn is_menu(self) -> bool {
         use crate::Button::*;
-        match self {
-            Select | Start | Mode => true,
-            _ => false,
-        }
+        matches!(self, Select | Start | Mode)
     }
 
     pub fn is_stick(self) -> bool {
         use crate::Button::*;
-        match self {
-            LeftThumb | RightThumb => true,
-            _ => false,
-        }
+        matches!(self, LeftThumb | RightThumb)
     }
 
     pub fn is_dpad(self) -> bool {
         use crate::Button::*;
-        match self {
-            DPadUp | DPadDown | DPadLeft | DPadRight => true,
-            _ => false,
-        }
+        matches!(self, DPadUp | DPadDown | DPadLeft | DPadRight)
     }
 
     pub fn to_nec(self) -> Option<Code> {
@@ -208,12 +199,6 @@ impl Button {
     }
 }
 
-impl Default for Button {
-    fn default() -> Self {
-        Button::Unknown
-    }
-}
-
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
@@ -236,10 +221,7 @@ impl Axis {
     /// Returns true if axis is `LeftStickX`, `LeftStickY`, `RightStickX` or `RightStickY`.
     pub fn is_stick(self) -> bool {
         use crate::Axis::*;
-        match self {
-            LeftStickX | LeftStickY | RightStickX | RightStickY => true,
-            _ => false,
-        }
+        matches!(self, LeftStickX | LeftStickY | RightStickX | RightStickY)
     }
 
     /// Returns the other axis from same element of gamepad, if any.
@@ -273,4 +255,10 @@ impl Axis {
 pub enum AxisOrBtn {
     Axis(Axis),
     Btn(Button),
+}
+
+impl AxisOrBtn {
+    pub(crate) fn is_button(&self) -> bool {
+        matches!(self, AxisOrBtn::Btn(_))
+    }
 }

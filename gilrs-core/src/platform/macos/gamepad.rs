@@ -24,6 +24,7 @@ use std::os::raw::c_void;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Gilrs {
@@ -51,34 +52,52 @@ impl Gilrs {
         tx: Sender<(Event, Option<IOHIDDevice>)>,
         device_infos: Arc<Mutex<Vec<DeviceInfo>>>,
     ) {
-        thread::spawn(move || unsafe {
-            let mut manager = match IOHIDManager::new() {
-                Some(manager) => manager,
-                None => {
-                    error!("Failed to create IOHIDManager object");
-                    return;
-                }
-            };
+        thread::Builder::new()
+            .name("gilrs".to_owned())
+            .spawn(move || unsafe {
+                let mut manager = match IOHIDManager::new() {
+                    Some(manager) => manager,
+                    None => {
+                        error!("Failed to create IOHIDManager object");
+                        return;
+                    }
+                };
 
-            manager.schedule_with_run_loop(CFRunLoop::get_current(), kCFRunLoopDefaultMode);
+                manager.schedule_with_run_loop(CFRunLoop::get_current(), kCFRunLoopDefaultMode);
 
-            let context = &(tx.clone(), device_infos.clone()) as *const _ as *mut c_void;
-            manager.register_device_matching_callback(device_matching_cb, context);
+                let context = &(tx.clone(), device_infos.clone()) as *const _ as *mut c_void;
+                manager.register_device_matching_callback(device_matching_cb, context);
 
-            let context = &(tx.clone(), device_infos.clone()) as *const _ as *mut c_void;
-            manager.register_device_removal_callback(device_removal_cb, context);
+                let context = &(tx.clone(), device_infos.clone()) as *const _ as *mut c_void;
+                manager.register_device_removal_callback(device_removal_cb, context);
 
-            let context = &(tx, device_infos) as *const _ as *mut c_void;
-            manager.register_input_value_callback(input_value_cb, context);
+                let context = &(tx, device_infos) as *const _ as *mut c_void;
+                manager.register_input_value_callback(input_value_cb, context);
 
-            CFRunLoop::run_current();
+                CFRunLoop::run_current();
 
-            manager.unschedule_from_run_loop(CFRunLoop::get_current(), kCFRunLoopDefaultMode);
-        });
+                manager.unschedule_from_run_loop(CFRunLoop::get_current(), kCFRunLoopDefaultMode);
+            })
+            .expect("failed to spawn thread");
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
-        match self.rx.try_recv().ok() {
+        let event = self.rx.try_recv().ok();
+        self.handle_event(event)
+    }
+
+    pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
+        let event = if let Some(timeout) = timeout {
+            self.rx.recv_timeout(timeout).ok()
+        } else {
+            self.rx.recv().ok()
+        };
+
+        self.handle_event(event)
+    }
+
+    fn handle_event(&mut self, event: Option<(Event, Option<IOHIDDevice>)>) -> Option<Event> {
+        match event {
             Some((event, Some(device))) => {
                 if event.event == EventType::Connected {
                     if self.gamepads.get(event.id).is_some() {
@@ -133,8 +152,11 @@ impl Gilrs {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Gamepad {
     name: String,
+    vendor: Option<u16>,
+    product: Option<u16>,
     uuid: Uuid,
     entry_id: u64,
     location_id: u32,
@@ -142,6 +164,7 @@ pub struct Gamepad {
     usage: u32,
     axes_info: VecMap<AxisInfo>,
     axes: Vec<EvCode>,
+    hats: Vec<EvCode>,
     buttons: Vec<EvCode>,
     is_connected: bool,
 }
@@ -217,6 +240,8 @@ impl Gamepad {
 
         let mut gamepad = Gamepad {
             name,
+            vendor: device.get_vendor_id(),
+            product: device.get_product_id(),
             uuid,
             entry_id,
             location_id,
@@ -224,6 +249,7 @@ impl Gamepad {
             usage,
             axes_info: VecMap::with_capacity(8),
             axes: Vec::with_capacity(8),
+            hats: Vec::with_capacity(4),
             buttons: Vec::with_capacity(16),
             is_connected: true,
         };
@@ -263,7 +289,7 @@ impl Gamepad {
         if vendor_id == 0 && product_id == 0 && version == 0 {
             None
         } else {
-            match Uuid::from_fields(
+            Some(Uuid::from_fields(
                 bustype,
                 vendor_id,
                 0,
@@ -277,18 +303,20 @@ impl Gamepad {
                     0,
                     0,
                 ],
-            ) {
-                Ok(uuid) => Some(uuid),
-                Err(error) => {
-                    warn!("Failed to create uuid of device: {:?}", error.to_string());
-                    None
-                }
-            }
+            ))
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn vendor_id(&self) -> Option<u16> {
+        self.vendor
+    }
+
+    pub fn product_id(&self) -> Option<u16> {
+        self.product
     }
 
     pub fn uuid(&self) -> Uuid {
@@ -334,6 +362,10 @@ impl Gamepad {
 
         self.collect_axes(&elements, &mut cookies);
         self.axes.sort_by_key(|axis| axis.usage);
+        self.hats.sort_by_key(|axis| axis.usage);
+        // Because "hat is axis" is gilrs thing, we want ensure that all hats are at the end of
+        // axis vector, so SDL mappings still works.
+        self.axes.extend(&self.hats);
 
         self.collect_buttons(&elements, &mut cookies);
         self.buttons.sort_by_key(|button| button.usage);
@@ -370,6 +402,7 @@ impl Gamepad {
                         deadzone: None,
                     },
                 );
+                self.hats.push(EvCode::new(page, usage));
                 // All hat switches are translated into *two* axes
                 self.axes_info.insert(
                     (usage + 1) as usize, // "+ 1" is assumed for usage of 2nd hat switch axis
@@ -379,6 +412,7 @@ impl Gamepad {
                         deadzone: None,
                     },
                 );
+                self.hats.push(EvCode::new(page, usage + 1));
             }
         }
     }
@@ -410,7 +444,7 @@ struct DeviceInfo {
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
 
-#[cfg_attr(feature="serde-serialize", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EvCode {
     page: u32,

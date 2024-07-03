@@ -11,7 +11,7 @@ use crate::{
         Axis, AxisOrBtn, Button, Code, Event, EventType,
     },
     ff::{
-        server::{self, Message},
+        server::{self, FfMessage, Message},
         Error as FfError,
     },
     mapping::{Mapping, MappingData, MappingDb},
@@ -24,11 +24,13 @@ use gilrs_core::{
 
 use uuid::Uuid;
 
+use std::cmp::Ordering;
 use std::{
     collections::VecDeque,
     error,
     fmt::{self, Display},
-    sync::mpsc::Sender,
+    sync::mpsc::{Receiver, Sender},
+    time::Duration,
 };
 
 pub use gilrs_core::PowerInfo;
@@ -132,14 +134,15 @@ pub struct Gilrs {
     inner: gilrs_core::Gilrs,
     next_id: usize,
     tx: Sender<Message>,
+    rx: Receiver<FfMessage>,
     counter: u64,
     mappings: MappingDb,
     default_filters: bool,
     events: VecDeque<Event>,
     axis_to_btn_pressed: f32,
     axis_to_btn_released: f32,
-    update_state: bool,
-    gamepads_data: Vec<GamepadData>,
+    pub(crate) update_state: bool,
+    pub(crate) gamepads_data: Vec<GamepadData>,
 }
 
 impl Gilrs {
@@ -151,15 +154,34 @@ impl Gilrs {
 
     /// Returns next pending event. If there is no pending event, `None` is
     /// returned. This function will not block current thread and should be safe
-    /// to call in async context.
+    /// to call in async context. Doesn't block the thread it is run in
     pub fn next_event(&mut self) -> Option<Event> {
+        self.next_event_inner(false, None)
+    }
+
+    /// Same as [Gilrs::next_event], but blocks the thread it is run in. Useful
+    /// for apps that aren't run inside a loop and just react to the user's input,
+    /// like GUI apps.
+    ///
+    /// ## Platform support
+    ///
+    /// This function is not supported on web and will always panic.
+    pub fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
+        self.next_event_inner(true, timeout)
+    }
+
+    fn next_event_inner(
+        &mut self,
+        is_blocking: bool,
+        blocking_timeout: Option<Duration>,
+    ) -> Option<Event> {
         use crate::ev::filter::{axis_dpad_to_button, deadzone, Filter, Jitter};
 
         let ev = if self.default_filters {
             let jitter_filter = Jitter::new();
             loop {
                 let ev = self
-                    .next_event_priv()
+                    .next_event_priv(is_blocking, blocking_timeout)
                     .filter_ev(&axis_dpad_to_button, self)
                     .filter_ev(&jitter_filter, self)
                     .filter_ev(&deadzone, self);
@@ -171,7 +193,7 @@ impl Gilrs {
                 }
             }
         } else {
-            self.next_event_priv()
+            self.next_event_priv(is_blocking, blocking_timeout)
         };
 
         if self.update_state {
@@ -184,11 +206,26 @@ impl Gilrs {
     }
 
     /// Returns next pending event.
-    fn next_event_priv(&mut self) -> Option<Event> {
+    fn next_event_priv(
+        &mut self,
+        is_blocking: bool,
+        blocking_timeout: Option<Duration>,
+    ) -> Option<Event> {
+        if let Some(msg) = self.rx.try_recv().ok() {
+            match msg {
+                FfMessage::EffectCompleted { event } => return Some(event),
+            }
+        }
         if let Some(ev) = self.events.pop_front() {
             Some(ev)
         } else {
-            match self.inner.next_event() {
+            let event = if is_blocking {
+                self.inner.next_event_blocking(blocking_timeout)
+            } else {
+                self.inner.next_event()
+            };
+
+            match event {
                 Some(RawEvent { id, event, time }) => {
                     trace!("Original event: {:?}", RawEvent { id, event, time });
                     let id = GamepadId(id);
@@ -286,27 +323,31 @@ impl Gilrs {
                             }
                         }
                         RawEventType::Connected => {
-                            if id.0 == self.gamepads_data.len() {
-                                self.gamepads_data.push(GamepadData::new(
-                                    id,
-                                    self.tx.clone(),
-                                    self.inner.gamepad(id.0).unwrap(),
-                                    &self.mappings,
-                                ));
-                            } else if id.0 < self.gamepads_data.len() {
-                                self.gamepads_data[id.0] = GamepadData::new(
-                                    id,
-                                    self.tx.clone(),
-                                    self.inner.gamepad(id.0).unwrap(),
-                                    &self.mappings,
-                                );
-                            } else {
-                                error!(
-                                    "Platform implementation error: got Connected event with id \
-                                     {}, when expected id {}",
-                                    id.0,
-                                    self.gamepads_data.len()
-                                );
+                            match id.0.cmp(&self.gamepads_data.len()) {
+                                Ordering::Equal => {
+                                    self.gamepads_data.push(GamepadData::new(
+                                        id,
+                                        self.tx.clone(),
+                                        self.inner.gamepad(id.0).unwrap(),
+                                        &self.mappings,
+                                    ));
+                                }
+                                Ordering::Less => {
+                                    self.gamepads_data[id.0] = GamepadData::new(
+                                        id,
+                                        self.tx.clone(),
+                                        self.inner.gamepad(id.0).unwrap(),
+                                        &self.mappings,
+                                    );
+                                }
+                                Ordering::Greater => {
+                                    error!(
+                                        "Platform implementation error: got Connected event with \
+                                         id {}, when expected id {}",
+                                        id.0,
+                                        self.gamepads_data.len()
+                                    );
+                                }
                             }
 
                             EventType::Connected
@@ -356,7 +397,7 @@ impl Gilrs {
                 data.state
                     .update_axis(nec, AxisData::new(value, counter, event.time));
             }
-            Disconnected | Connected | Dropped => (),
+            Disconnected | Connected | Dropped | ForceFeedbackEffectCompleted => (),
         }
     }
 
@@ -430,7 +471,7 @@ impl Gilrs {
         // Make sure that it will not panic even with invalid GamepadId, so ConnectedGamepadIterator
         // will always work.
         if let Some(data) = self.gamepads_data.get(id.0) {
-            let inner = self.inner.gamepad(id.0).unwrap();
+            let inner = self.inner.gamepad(id.0)?;
 
             if inner.is_connected() {
                 Some(Gamepad { inner, data })
@@ -506,7 +547,7 @@ impl Gilrs {
         name: O,
     ) -> Result<String, MappingError> {
         if let Some(gamepad) = self.inner.gamepad(gamepad_id) {
-            if gamepad.is_connected() {
+            if !gamepad.is_connected() {
                 return Err(MappingError::NotConnected);
             }
 
@@ -676,10 +717,13 @@ impl GilrsBuilder {
             Err(PlatformError::Other(e)) => return Err(Error::Other(e)),
         };
 
+        let (tx, rx) = server::init();
+
         let mut gilrs = Gilrs {
             inner,
             next_id: 0,
-            tx: server::init(),
+            tx,
+            rx,
             counter: 0,
             mappings: self.mappings,
             default_filters: self.default_filters,
@@ -771,6 +815,16 @@ impl<'a> Gamepad<'a> {
     /// Always None in other platforms.
     pub fn mount_point(&self) -> Option<String> {
         self.inner.mount_point()
+    }
+
+    /// Returns the vendor ID, as assigned by the USB-IF, when available.
+    pub fn vendor_id(&self) -> Option<u16> {
+        self.inner.vendor_id()
+    }
+
+    /// Returns the product ID, as assigned by the vendor, when available.
+    pub fn product_id(&self) -> Option<u16> {
+        self.inner.product_id()
     }
 
     /// Returns cached gamepad state.
@@ -911,11 +965,13 @@ impl<'a> Gamepad<'a> {
 }
 
 #[derive(Debug)]
-struct GamepadData {
+pub(crate) struct GamepadData {
     state: GamepadState,
     mapping: Mapping,
     tx: Sender<Message>,
     id: GamepadId,
+    // Flags used by the deadzone filter.
+    pub(crate) have_sent_nonzero_for_axis: [bool; 6],
 }
 
 impl GamepadData {
@@ -927,7 +983,20 @@ impl GamepadData {
     ) -> Self {
         let mapping = db
             .get(Uuid::from_bytes(gamepad.uuid()))
-            .and_then(|s| Mapping::parse_sdl_mapping(s, gamepad.buttons(), gamepad.axes()).ok())
+            .map(
+                |s| match Mapping::parse_sdl_mapping(s, gamepad.buttons(), gamepad.axes()) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!(
+                            "Unable to parse SDL mapping for UUID {}\n\t{:?}\n\tDefault mapping \
+                             will be used.",
+                            Uuid::from_bytes(gamepad.uuid()),
+                            e
+                        );
+                        Mapping::default(gamepad)
+                    }
+                },
+            )
             .unwrap_or_else(|| Mapping::default(gamepad));
 
         if gamepad.is_ff_supported() && gamepad.is_connected() {
@@ -941,6 +1010,7 @@ impl GamepadData {
             mapping,
             tx,
             id,
+            have_sent_nonzero_for_axis: Default::default(),
         }
     }
 
@@ -953,7 +1023,7 @@ impl GamepadData {
         if self.mapping.is_default() {
             None
         } else {
-            Some(&self.mapping.name())
+            Some(self.mapping.name())
         }
     }
 
@@ -1022,7 +1092,7 @@ impl GamepadData {
 }
 
 /// Source of gamepad mappings.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MappingSource {
     /// Gamepad uses SDL mappings.
     SdlMappings,
@@ -1041,9 +1111,9 @@ pub enum MappingSource {
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 pub struct GamepadId(pub(crate) usize);
 
-impl Into<usize> for GamepadId {
-    fn into(self) -> usize {
-        self.0
+impl From<GamepadId> for usize {
+    fn from(x: GamepadId) -> usize {
+        x.0
     }
 }
 
@@ -1119,6 +1189,13 @@ impl error::Error for Error {
         }
     }
 }
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+
+    #[cfg(not(target_arch = "wasm32"))]
+    assert_send::<Gilrs>();
+};
 
 #[cfg(test)]
 mod tests {
