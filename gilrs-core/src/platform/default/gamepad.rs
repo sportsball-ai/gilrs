@@ -11,6 +11,7 @@ use crate::{AxisInfo, Event, PlatformError, PowerInfo};
 use uuid::Uuid;
 
 use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub struct Gilrs {}
@@ -21,6 +22,10 @@ impl Gilrs {
     }
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
+        None
+    }
+
+    pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
         None
     }
 
@@ -46,6 +51,14 @@ impl Gamepad {
 
     pub fn uuid(&self) -> Uuid {
         Uuid::nil()
+    }
+
+    pub fn vendor_id(&self) -> Option<u16> {
+        None
+    }
+
+    pub fn product_id(&self) -> Option<u16> {
+        None
     }
 
     pub fn power_info(&self) -> PowerInfo {
@@ -81,7 +94,7 @@ impl Gamepad {
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
 
-#[cfg_attr(feature="serde-serialize", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EvCode(u16);
 

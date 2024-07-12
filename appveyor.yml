@@ -2,11 +2,11 @@
 # https://github.com/japaric/trust/tree/v0.1.1
 
 image:
-  - Visual Studio 2017
+  - Visual Studio 2022
 
 environment:
   global:
-    RUST_VERSION: 1.40.0
+    RUST_VERSION: 1.73.0
     CRATE_NAME: gilrs
 
   matrix:

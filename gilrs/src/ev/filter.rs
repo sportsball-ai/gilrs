@@ -126,6 +126,20 @@ fn apply_deadzone(x: f32, y: f32, threshold: f32) -> (f32, f32) {
     }
 }
 
+fn deadzone_nonzero_axis_idx(axis: Axis) -> Option<usize> {
+    Some(match axis {
+        Axis::DPadX => 0,
+        Axis::DPadY => 1,
+        Axis::LeftStickX => 2,
+        Axis::LeftStickY => 3,
+        Axis::RightStickX => 4,
+        Axis::RightStickY => 5,
+        _ => {
+            return None;
+        }
+    })
+}
+
 /// Drops events in dead zone and remaps value to keep it in standard range.
 pub fn deadzone(ev: Option<Event>, gilrs: &mut Gilrs) -> Option<Event> {
     match ev {
@@ -139,16 +153,37 @@ pub fn deadzone(ev: Option<Event>, gilrs: &mut Gilrs) -> Option<Event> {
                 None => return ev,
             };
 
-            if let Some((_, other_code)) = axis
+            if let Some((other_axis, other_code)) = axis
                 .second_axis()
                 .and_then(|axis| gilrs.gamepad(id).axis_code(axis).map(|code| (axis, code)))
             {
                 let other_val = gilrs.gamepad(id).state().value(other_code);
                 let val = apply_deadzone(val, other_val, threshold);
 
+                // Since this is the second axis, deadzone_nonzero_axis_idx() will always returns something.
+                let other_axis_idx = deadzone_nonzero_axis_idx(other_axis).unwrap();
+
+                if val.0 == 0.
+                    && val.1 == 0.
+                    && gilrs.gamepads_data[id.0].have_sent_nonzero_for_axis[other_axis_idx]
+                    && gilrs.gamepad(id).state().value(other_code) != 0.
+                {
+                    // Clear other axis that is now within the dead zone threshold.
+                    gilrs.insert_event(Event {
+                        id,
+                        time,
+                        event: EventType::AxisChanged(other_axis, 0., other_code),
+                    });
+                    gilrs.gamepads_data[id.0].have_sent_nonzero_for_axis[other_axis_idx] = false;
+                }
+
                 Some(if gilrs.gamepad(id).state().value(nec) == val.0 {
                     Event::new(id, EventType::Dropped)
                 } else {
+                    if let Some(axis_idx) = deadzone_nonzero_axis_idx(axis) {
+                        gilrs.gamepads_data[id.0].have_sent_nonzero_for_axis[axis_idx] =
+                            val.0 != 0.;
+                    }
                     Event {
                         id,
                         time,
@@ -161,6 +196,9 @@ pub fn deadzone(ev: Option<Event>, gilrs: &mut Gilrs) -> Option<Event> {
                 Some(if gilrs.gamepad(id).state().value(nec) == val {
                     Event::new(id, EventType::Dropped)
                 } else {
+                    if let Some(axis_idx) = deadzone_nonzero_axis_idx(axis) {
+                        gilrs.gamepads_data[id.0].have_sent_nonzero_for_axis[axis_idx] = val != 0.;
+                    }
                     Event {
                         id,
                         time,
@@ -197,7 +235,7 @@ pub fn deadzone(ev: Option<Event>, gilrs: &mut Gilrs) -> Option<Event> {
 
 /// Maps axis dpad events to button dpad events.
 ///
-/// This filter will do nothing if gamepad have dpad buttons (to prevent double events for same
+/// This filter will do nothing if gamepad has dpad buttons (to prevent double events for same
 /// element) and if standard `NativeEvCode` for dpads is used by some other buttons. It will always
 /// try to map if SDL mappings contains mappings for all four hats.
 pub fn axis_dpad_to_button(ev: Option<Event>, gilrs: &mut Gilrs) -> Option<Event> {
@@ -219,74 +257,175 @@ pub fn axis_dpad_to_button(ev: Option<Event>, gilrs: &mut Gilrs) -> Option<Event
         }
     }
 
-    match ev {
-        Some(Event {
-            event: EventType::AxisChanged(Axis::DPadX, val, _),
-            id,
-            time,
-        }) if can_map(&gilrs.gamepad(id)) => Some(if val == 1.0 {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonPressed(Button::DPadRight, Code(necs::BTN_DPAD_RIGHT)),
+    let ev = ev?;
+    let gamepad = gilrs.gamepad(ev.id);
+
+    if !can_map(&gamepad) {
+        return Some(ev);
+    }
+
+    let mut out_event = ev.drop();
+
+    match ev.event {
+        EventType::AxisChanged(Axis::DPadX, val, _) => {
+            let mut release_left = false;
+            let mut release_right = false;
+
+            if val == 1.0 {
+                // The axis value might change from left (-1.0) to right (1.0) immediately without
+                // us getting an additional event for the release at the center position (0.0).
+                release_left = gamepad.state().is_pressed(Code(necs::BTN_DPAD_LEFT));
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(
+                        Button::DPadRight,
+                        1.0,
+                        Code(necs::BTN_DPAD_RIGHT),
+                    ),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonPressed(Button::DPadRight, Code(necs::BTN_DPAD_RIGHT)),
+                    ..ev
+                };
+            } else if val == -1.0 {
+                // The axis value might change from right (1.0) to left (-1.0) immediately without
+                // us getting an additional event for the release at the center position (0.0).
+                release_right = gamepad.state().is_pressed(Code(necs::BTN_DPAD_RIGHT));
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(
+                        Button::DPadLeft,
+                        1.0,
+                        Code(necs::BTN_DPAD_LEFT),
+                    ),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonPressed(Button::DPadLeft, Code(necs::BTN_DPAD_LEFT)),
+                    ..ev
+                };
+            } else {
+                release_left = gamepad.state().is_pressed(Code(necs::BTN_DPAD_LEFT));
+                release_right = gamepad.state().is_pressed(Code(necs::BTN_DPAD_RIGHT));
             }
-        } else if val == -1.0 {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonPressed(Button::DPadLeft, Code(necs::BTN_DPAD_LEFT)),
+
+            if release_right {
+                if !out_event.is_dropped() {
+                    gilrs.insert_event(out_event);
+                }
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(
+                        Button::DPadRight,
+                        0.0,
+                        Code(necs::BTN_DPAD_RIGHT),
+                    ),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonReleased(Button::DPadRight, Code(necs::BTN_DPAD_RIGHT)),
+                    ..ev
+                };
             }
-        } else if gilrs
-            .gamepad(id)
-            .state()
-            .is_pressed(Code(necs::BTN_DPAD_RIGHT))
-        {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonReleased(Button::DPadRight, Code(necs::BTN_DPAD_RIGHT)),
+
+            if release_left {
+                if !out_event.is_dropped() {
+                    gilrs.insert_event(out_event);
+                }
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(
+                        Button::DPadLeft,
+                        0.0,
+                        Code(necs::BTN_DPAD_LEFT),
+                    ),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonReleased(Button::DPadLeft, Code(necs::BTN_DPAD_LEFT)),
+                    ..ev
+                };
             }
-        } else {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonReleased(Button::DPadLeft, Code(necs::BTN_DPAD_LEFT)),
+
+            Some(out_event)
+        }
+        EventType::AxisChanged(Axis::DPadY, val, _) => {
+            let mut release_up = false;
+            let mut release_down = false;
+
+            if val == 1.0 {
+                // The axis value might change from down (-1.0) to up (1.0) immediately without us
+                // getting an additional event for the release at the center position (0.0).
+                release_down = gamepad.state().is_pressed(Code(necs::BTN_DPAD_DOWN));
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(Button::DPadUp, 1.0, Code(necs::BTN_DPAD_UP)),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonPressed(Button::DPadUp, Code(necs::BTN_DPAD_UP)),
+                    ..ev
+                };
+            } else if val == -1.0 {
+                // The axis value might change from up (1.0) to down (-1.0) immediately without us
+                // getting an additional event for the release at the center position (0.0).
+                release_up = gamepad.state().is_pressed(Code(necs::BTN_DPAD_UP));
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(
+                        Button::DPadDown,
+                        1.0,
+                        Code(necs::BTN_DPAD_DOWN),
+                    ),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonPressed(Button::DPadDown, Code(necs::BTN_DPAD_DOWN)),
+                    ..ev
+                };
+            } else {
+                release_up = gamepad.state().is_pressed(Code(necs::BTN_DPAD_UP));
+                release_down = gamepad.state().is_pressed(Code(necs::BTN_DPAD_DOWN));
             }
-        }),
-        Some(Event {
-            event: EventType::AxisChanged(Axis::DPadY, val, _),
-            id,
-            time,
-        }) if can_map(&gilrs.gamepad(id)) => Some(if val == 1.0 {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonPressed(Button::DPadUp, Code(necs::BTN_DPAD_UP)),
+
+            if release_up {
+                if !out_event.is_dropped() {
+                    gilrs.insert_event(out_event);
+                }
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(Button::DPadUp, 0.0, Code(necs::BTN_DPAD_UP)),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonReleased(Button::DPadUp, Code(necs::BTN_DPAD_UP)),
+                    ..ev
+                };
             }
-        } else if val == -1.0 {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonPressed(Button::DPadDown, Code(necs::BTN_DPAD_DOWN)),
+
+            if release_down {
+                if !out_event.is_dropped() {
+                    gilrs.insert_event(out_event);
+                }
+
+                gilrs.insert_event(Event {
+                    event: EventType::ButtonChanged(
+                        Button::DPadDown,
+                        0.0,
+                        Code(necs::BTN_DPAD_DOWN),
+                    ),
+                    ..ev
+                });
+                out_event = Event {
+                    event: EventType::ButtonReleased(Button::DPadDown, Code(necs::BTN_DPAD_DOWN)),
+                    ..ev
+                };
             }
-        } else if gilrs
-            .gamepad(id)
-            .state()
-            .is_pressed(Code(necs::BTN_DPAD_UP))
-        {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonReleased(Button::DPadUp, Code(necs::BTN_DPAD_UP)),
-            }
-        } else {
-            Event {
-                id,
-                time,
-                event: EventType::ButtonReleased(Button::DPadDown, Code(necs::BTN_DPAD_DOWN)),
-            }
-        }),
-        _ => ev,
+
+            Some(out_event)
+        }
+        _ => Some(ev),
     }
 }
 
@@ -399,7 +538,7 @@ impl Filter for Event {
     fn filter_ev<F: FilterFn>(&self, filter: &F, gilrs: &mut Gilrs) -> Option<Event> {
         let e = filter.filter(Some(*self), gilrs);
         debug_assert!(
-            !e.is_none(),
+            e.is_some(),
             "Filter changed Some(event) into None. See ev::filter documentation for more info."
         );
 

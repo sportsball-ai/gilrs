@@ -10,12 +10,16 @@ use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo};
 
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    mpsc::{self, Receiver, Sender},
+    Arc,
+};
 use std::time::Duration;
 use std::{mem, thread, u16, u32};
 
-use rusty_xinput::XInputLoadingFailure;
-use rusty_xinput::{self, BatteryLevel, BatteryType, XInputState, XInputUsageError};
+use rusty_xinput::{
+    BatteryLevel, BatteryType, XInputHandle, XInputLoadingFailure, XInputState, XInputUsageError,
+};
 use uuid::Uuid;
 use winapi::um::xinput::{
     XINPUT_GAMEPAD as XGamepad, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -39,24 +43,28 @@ pub struct Gilrs {
 
 impl Gilrs {
     pub(crate) fn new() -> Result<Self, PlatformError> {
-        match rusty_xinput::dynamic_load_xinput() {
-            Ok(()) => (),
-            Err(XInputLoadingFailure::AlreadyLoading)
-            | Err(XInputLoadingFailure::AlreadyActive) => (),
-            Err(e) => return Err(PlatformError::Other(Box::new(Error::FailedToLoadDll(e)))),
+        let xinput_handle = XInputHandle::load_default()
+            .map_err(|e| PlatformError::Other(Box::new(Error::FailedToLoadDll(e))))?;
+        let xinput_handle = Arc::new(xinput_handle);
+
+        let mut gamepad_ids: [usize; MAX_XINPUT_CONTROLLERS] = Default::default();
+
+        for id in 0..MAX_XINPUT_CONTROLLERS {
+            gamepad_ids[id] = id;
         }
 
-        let mut gamepads: [Gamepad; MAX_XINPUT_CONTROLLERS] = Default::default();
+        // Map controller IDs to Gamepads
+        let gamepads = gamepad_ids.map(|id| Gamepad::new(id as u32, xinput_handle.clone()));
+
         let mut connected: [bool; MAX_XINPUT_CONTROLLERS] = Default::default();
 
         // Iterate through each controller ID and set connected state
         for id in 0..MAX_XINPUT_CONTROLLERS {
-            gamepads[id] = Gamepad::new(id as u32);
             connected[id] = gamepads[id].is_connected;
         }
 
         let (tx, rx) = mpsc::channel();
-        Self::spawn_thread(tx, connected);
+        Self::spawn_thread(tx, connected, xinput_handle.clone());
 
         // Coerce gamepads vector to slice
         Ok(Gilrs { gamepads, rx })
@@ -64,7 +72,24 @@ impl Gilrs {
 
     pub(crate) fn next_event(&mut self) -> Option<Event> {
         let ev = self.rx.try_recv().ok();
+        self.handle_evevnt(ev);
 
+        ev
+    }
+
+    pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
+        let ev = if let Some(tiemout) = timeout {
+            self.rx.recv_timeout(tiemout).ok()
+        } else {
+            self.rx.recv().ok()
+        };
+
+        self.handle_evevnt(ev);
+
+        ev
+    }
+
+    fn handle_evevnt(&mut self, ev: Option<Event>) {
         if let Some(ev) = ev {
             match ev.event {
                 EventType::Connected => self.gamepads[ev.id].is_connected = true,
@@ -72,8 +97,6 @@ impl Gilrs {
                 _ => (),
             }
         }
-
-        ev
     }
 
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
@@ -84,50 +107,57 @@ impl Gilrs {
         self.gamepads.len()
     }
 
-    fn spawn_thread(tx: Sender<Event>, connected: [bool; MAX_XINPUT_CONTROLLERS]) {
-        thread::spawn(move || unsafe {
-            // Issue #70 fix - Maintain a prev_state per controller id. Otherwise the loop will compare the prev_state of a different controller.
-            let mut prev_states: [XState; MAX_XINPUT_CONTROLLERS] =
-                [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
-            let mut connected = connected;
-            let mut counter = 0;
+    fn spawn_thread(
+        tx: Sender<Event>,
+        connected: [bool; MAX_XINPUT_CONTROLLERS],
+        xinput_handle: Arc<XInputHandle>,
+    ) {
+        std::thread::Builder::new()
+            .name("gilrs".to_owned())
+            .spawn(move || unsafe {
+                // Issue #70 fix - Maintain a prev_state per controller id. Otherwise the loop will compare the prev_state of a different controller.
+                let mut prev_states: [XState; MAX_XINPUT_CONTROLLERS] =
+                    [mem::zeroed::<XState>(); MAX_XINPUT_CONTROLLERS];
+                let mut connected = connected;
+                let mut counter = 0;
 
-            loop {
-                for id in 0..MAX_XINPUT_CONTROLLERS {
-                    if *connected.get_unchecked(id)
-                        || counter % ITERATIONS_TO_CHECK_IF_CONNECTED == 0
-                    {
-                        match rusty_xinput::xinput_get_state(id as u32) {
-                            Ok(XInputState { raw: state }) => {
-                                if !connected[id] {
-                                    connected[id] = true;
-                                    let _ = tx.send(Event::new(id, EventType::Connected));
-                                }
+                loop {
+                    for id in 0..MAX_XINPUT_CONTROLLERS {
+                        if *connected.get_unchecked(id)
+                            || counter % ITERATIONS_TO_CHECK_IF_CONNECTED == 0
+                        {
+                            match xinput_handle.get_state(id as u32) {
+                                Ok(XInputState { raw: state }) => {
+                                    if !connected[id] {
+                                        connected[id] = true;
+                                        let _ = tx.send(Event::new(id, EventType::Connected));
+                                    }
 
-                                if state.dwPacketNumber != prev_states[id].dwPacketNumber {
-                                    Self::compare_state(
-                                        id,
-                                        &state.Gamepad,
-                                        &prev_states[id].Gamepad,
-                                        &tx,
-                                    );
-                                    prev_states[id] = state;
+                                    if state.dwPacketNumber != prev_states[id].dwPacketNumber {
+                                        Self::compare_state(
+                                            id,
+                                            &state.Gamepad,
+                                            &prev_states[id].Gamepad,
+                                            &tx,
+                                        );
+                                        prev_states[id] = state;
+                                    }
                                 }
+                                Err(XInputUsageError::DeviceNotConnected) if connected[id] => {
+                                    connected[id] = false;
+                                    let _ = tx.send(Event::new(id, EventType::Disconnected));
+                                }
+                                Err(XInputUsageError::DeviceNotConnected) => (),
+                                Err(e) => error!("Failed to get gamepad state: {:?}", e),
                             }
-                            Err(XInputUsageError::DeviceNotConnected) if connected[id] => {
-                                connected[id] = false;
-                                let _ = tx.send(Event::new(id, EventType::Disconnected));
-                            }
-                            Err(XInputUsageError::DeviceNotConnected) => (),
-                            Err(e) => error!("Failed to get gamepad state: {:?}", e),
                         }
                     }
-                }
 
-                counter = counter.wrapping_add(1);
-                thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
-            }
-        });
+                    counter = counter.wrapping_add(1);
+                    thread::sleep(Duration::from_millis(EVENT_THREAD_SLEEP_TIME));
+                }
+            })
+            .expect("failed to spawn thread");
     }
 
     fn compare_state(id: usize, g: &XGamepad, pg: &XGamepad, tx: &Sender<Event>) {
@@ -356,17 +386,18 @@ impl Gilrs {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Gamepad {
     uuid: Uuid,
     id: u32,
     is_connected: bool,
+    xinput_handle: Arc<XInputHandle>,
 }
 
 impl Gamepad {
-    fn new(id: u32) -> Gamepad {
+    fn new(id: u32, xinput_handle: Arc<XInputHandle>) -> Gamepad {
         let is_connected = {
-            if rusty_xinput::xinput_get_state(id).is_ok() {
+            if xinput_handle.get_state(id).is_ok() {
                 true
             } else {
                 false
@@ -377,6 +408,7 @@ impl Gamepad {
             uuid: Uuid::nil(),
             id,
             is_connected,
+            xinput_handle,
         };
 
         gamepad
@@ -394,12 +426,20 @@ impl Gamepad {
         None
     }
 
+    pub fn vendor_id(&self) -> Option<u16> {
+        None
+    }
+
+    pub fn product_id(&self) -> Option<u16> {
+        None
+    }
+
     pub fn is_connected(&self) -> bool {
         self.is_connected
     }
 
     pub fn power_info(&self) -> PowerInfo {
-        match rusty_xinput::xinput_get_gamepad_battery_information(self.id) {
+        match self.xinput_handle.get_gamepad_battery_information(self.id) {
             Ok(binfo) => match binfo.battery_type {
                 BatteryType::WIRED => PowerInfo::Wired,
                 BatteryType::ALKALINE | BatteryType::NIMH => {
@@ -435,7 +475,7 @@ impl Gamepad {
     }
 
     pub fn ff_device(&self) -> Option<FfDevice> {
-        Some(FfDevice::new(self.id))
+        Some(FfDevice::new(self.id, self.xinput_handle.clone()))
     }
 
     pub fn buttons(&self) -> &[EvCode] {
@@ -461,7 +501,7 @@ fn is_mask_eq(l: u16, r: u16, mask: u16) -> bool {
 #[cfg(feature = "serde-serialize")]
 use serde::{Deserialize, Serialize};
 
-#[cfg_attr(feature="serde-serialize", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EvCode(u8);
 

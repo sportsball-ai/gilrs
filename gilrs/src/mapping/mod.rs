@@ -9,13 +9,14 @@
 mod parser;
 
 use crate::ev::{self, Axis, AxisOrBtn, Button};
+use crate::utils::PATH_SEPARATOR;
 use gilrs_core::native_ev_codes as nec;
 use gilrs_core::EvCode;
 
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::fmt::{Display, Formatter, Result as FmtResult, Write as _};
 
 use fnv::FnvHashMap;
 use uuid::Uuid;
@@ -24,18 +25,18 @@ use vec_map::VecMap;
 use self::parser::{Error as ParserError, ErrorKind as ParserErrorKind, Parser, Token};
 
 /// Platform name used by SDL mappings
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd"))]
 const SDL_PLATFORM_NAME: &str = "Linux";
 #[cfg(target_os = "macos")]
-const SDL_PLATFORM_NAME: &'static str = "Mac OS X";
+const SDL_PLATFORM_NAME: &str = "Mac OS X";
 #[cfg(target_os = "windows")]
-const SDL_PLATFORM_NAME: &'static str = "Windows";
+const SDL_PLATFORM_NAME: &str = "Windows";
 #[cfg(all(
-    not(target_os = "linux"),
+    not(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd")),
     not(target_os = "macos"),
     not(target_os = "windows")
 ))]
-const SDL_PLATFORM_NAME: &'static str = "Unknown";
+const SDL_PLATFORM_NAME: &str = "Unknown";
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -187,7 +188,7 @@ impl Mapping {
         }
 
         let mut mappings = FnvHashMap::default();
-        let mut sdl_mappings = format!("{},{},", uuid.to_simple(), name);
+        let mut sdl_mappings = format!("{},{},", uuid.as_simple(), name);
 
         {
             let mut add_button = |ident, ev_code, mapped_btn| {
@@ -272,6 +273,7 @@ impl Mapping {
         let mut mapping = Mapping::new();
         let mut parser = Parser::new(line);
 
+        let mut uuid: Option<Uuid> = None;
         while let Some(token) = parser.next_token() {
             if let Err(ref e) = token {
                 if e.kind() == &ParserErrorKind::EmptyValue {
@@ -287,24 +289,40 @@ impl Mapping {
                         warn!("Mappings for different platform – {}", platform);
                     }
                 }
-                Token::Uuid(_) => (),
+                Token::Uuid(v) => uuid = Some(v),
+
                 Token::Name(name) => mapping.name = name.to_owned(),
                 Token::AxisMapping { from, to, .. } => {
-                    let axis = axes
-                        .get(from as usize)
-                        .cloned()
-                        .ok_or(ParseSdlMappingError::InvalidAxis)?;
-                    mapping.mappings.insert(axis, to);
+                    let axis = axes.get(from as usize).cloned();
+                    if let Some(axis) = axis {
+                        mapping.mappings.insert(axis, to);
+                    } else {
+                        warn!(
+                            "SDL-mapping {} {}: Unknown axis a{}",
+                            uuid.unwrap(),
+                            mapping.name,
+                            from
+                        )
+                    }
                 }
-                Token::ButtonMapping { from, to } => {
-                    let btn = buttons
-                        .get(from as usize)
-                        .cloned()
-                        .ok_or(ParseSdlMappingError::InvalidButton)?;
-                    mapping.mappings.insert(btn, AxisOrBtn::Btn(to));
+                Token::ButtonMapping { from, to, .. } => {
+                    let btn = buttons.get(from as usize).cloned();
+
+                    if let Some(btn) = btn {
+                        mapping.mappings.insert(btn, to);
+                    } else {
+                        warn!(
+                            "SDL-mapping {} {}: Unknown button b{}",
+                            uuid.unwrap(),
+                            mapping.name,
+                            from
+                        )
+                    }
                 }
-                Token::HatMapping { hat, direction, to } => {
-                    if hat != 0 || !to.is_dpad() {
+                Token::HatMapping {
+                    hat, direction, to, ..
+                } => {
+                    if hat != 0 {
                         warn!(
                             "Hat mappings are only supported for dpads (requested to map hat \
                              {}.{} to {:?}",
@@ -325,14 +343,25 @@ impl Mapping {
                             _ => return Err(ParseSdlMappingError::UnknownHatDirection),
                         };
 
-                        let to_axis = match to {
-                            Button::DPadLeft | Button::DPadRight => Axis::DPadX,
-                            Button::DPadUp | Button::DPadDown => Axis::DPadY,
-                            _ => unreachable!(),
-                        };
+                        if to.is_button() {
+                            match to {
+                                AxisOrBtn::Btn(Button::DPadLeft | Button::DPadRight) => {
+                                    mapping
+                                        .mappings
+                                        .insert(from_axis, AxisOrBtn::Axis(Axis::DPadX));
+                                }
+                                AxisOrBtn::Btn(Button::DPadUp | Button::DPadDown) => {
+                                    mapping
+                                        .mappings
+                                        .insert(from_axis, AxisOrBtn::Axis(Axis::DPadY));
+                                }
+                                _ => (),
+                            }
+                            mapping.mappings.insert(from_btn, to);
+                        } else {
+                            mapping.mappings.insert(from_axis, to);
+                        }
 
-                        mapping.mappings.insert(from_axis, AxisOrBtn::Axis(to_axis));
-                        mapping.mappings.insert(from_btn, AxisOrBtn::Btn(to));
                         mapping.hats_mapped |= direction as u8;
                     }
                 }
@@ -354,7 +383,7 @@ impl Mapping {
             .iter()
             .position(|&x| x == ev_code)
             .ok_or(MappingError::InvalidCode(ev::Code(ev_code)))?;
-        sdl_mappings.push_str(&format!("{}:b{},", ident, n_btn));
+        let _ = write!(sdl_mappings, "{}:b{},", ident, n_btn);
         mappings.insert(ev_code, AxisOrBtn::Btn(mapped_btn));
         Ok(())
     }
@@ -371,7 +400,7 @@ impl Mapping {
             .iter()
             .position(|&x| x == ev_code)
             .ok_or(MappingError::InvalidCode(ev::Code(ev_code)))?;
-        sdl_mappings.push_str(&format!("{}:a{},", ident, n_axis));
+        let _ = write!(sdl_mappings, "{}:a{},", ident, n_axis);
         mappings.insert(ev_code, AxisOrBtn::Axis(mapped_axis));
         Ok(())
     }
@@ -399,10 +428,8 @@ impl Mapping {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ParseSdlMappingError {
-    InvalidButton,
-    InvalidAxis,
     UnknownHatDirection,
     ParseError(ParserError),
 }
@@ -425,14 +452,12 @@ impl Error for ParseSdlMappingError {
 
 impl Display for ParseSdlMappingError {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> FmtResult {
-        let s = match self {
-            ParseSdlMappingError::InvalidButton => "gamepad doesn't have requested button",
-            ParseSdlMappingError::InvalidAxis => "gamepad doesn't have requested axis",
-            ParseSdlMappingError::UnknownHatDirection => "hat direction wasn't 1, 2, 4 or 8",
-            ParseSdlMappingError::ParseError(_) => "parsing error",
-        };
-
-        fmt.write_str(s)
+        match self {
+            ParseSdlMappingError::UnknownHatDirection => {
+                fmt.write_str("hat direction wasn't 1, 2, 4 or 8")
+            }
+            ParseSdlMappingError::ParseError(_) => fmt.write_str("parsing error"),
+        }
     }
 }
 
@@ -449,9 +474,11 @@ impl MappingDb {
     }
 
     pub fn add_included_mappings(&mut self) {
-        self.insert(include_str!(
-            "../../SDL_GameControllerDB/gamecontrollerdb.txt"
-        ));
+        self.insert(include_str!(concat!(
+            env!("OUT_DIR"),
+            PATH_SEPARATOR!(),
+            "gamecontrollerdb.txt"
+        )));
     }
 
     pub fn add_env_mappings(&mut self) {
@@ -465,7 +492,7 @@ impl MappingDb {
             let pat = "platform:";
             if let Some(offset) = mapping.find(pat).map(|o| o + pat.len()) {
                 let s = &mapping[offset..];
-                let end = s.find(',').unwrap_or_else(|| s.len());
+                let end = s.find(',').unwrap_or(s.len());
 
                 if &s[..end] != SDL_PLATFORM_NAME {
                     continue;
@@ -544,7 +571,7 @@ impl MappingData {
 }
 
 /// The error type for functions related to gamepad mapping.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MappingError {
     /// Gamepad does not have element referenced by `EvCode`.
     InvalidCode(ev::Code),

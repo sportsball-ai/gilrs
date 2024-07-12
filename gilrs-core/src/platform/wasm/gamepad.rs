@@ -5,31 +5,41 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use super::FfDevice;
-use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo};
-use uuid::Uuid;
-
 use std::collections::VecDeque;
-#[cfg(not(feature = "wasm-bindgen"))]
-use stdweb::web::{Gamepad as WebGamepad, GamepadMappingType};
-#[cfg(feature = "wasm-bindgen")]
-use web_sys::{Gamepad as WebGamepad, GamepadButton, GamepadMappingType};
-
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::i32::MAX as I32_MAX;
+use std::time::Duration;
+
+use js_sys::RegExp;
+use uuid::Uuid;
+use wasm_bindgen::JsCast;
+use web_sys::{DomException, Gamepad as WebGamepad, GamepadButton, GamepadMappingType};
+
+use super::FfDevice;
+use crate::platform::native_ev_codes::{BTN_LT2, BTN_RT2};
+use crate::{AxisInfo, Event, EventType, PlatformError, PowerInfo};
+#[cfg(feature = "serde-serialize")]
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
 pub struct Gilrs {
     gamepads: Vec<Gamepad>,
     event_cache: VecDeque<Event>,
+    next_event_error_logged: bool,
 }
 
 impl Gilrs {
     pub(crate) fn new() -> Result<Self, PlatformError> {
+        let window =
+            web_sys::window().ok_or_else(|| PlatformError::Other(Box::new(Error::NoWindow)))?;
+        if !window.is_secure_context() {
+            warn!("Context is not secure, gamepad API may not be available.")
+        }
+
         Ok({
             Gilrs {
                 gamepads: Vec::new(),
                 event_cache: VecDeque::new(),
+                next_event_error_logged: false,
             }
         })
     }
@@ -41,45 +51,81 @@ impl Gilrs {
             return self.event_cache.pop_front();
         }
 
-        #[cfg(not(feature = "wasm-bindgen"))]
-        let gamepads = WebGamepad::get_all().into_iter();
-
-        #[cfg(feature = "wasm-bindgen")]
-        let gamepads = web_sys::window()
+        let gamepads = match web_sys::window()
             .expect("no window")
             .navigator()
             .get_gamepads()
-            .expect("error getting gamepads");
-        #[cfg(feature = "wasm-bindgen")]
-        let gamepads = gamepads.iter().map(|val| {
-            if val.is_null() {
-                None
-            } else {
-                Some(WebGamepad::from(val))
+        {
+            Ok(x) => {
+                self.next_event_error_logged = false;
+                x
             }
-        });
+            Err(js) => {
+                if !self.next_event_error_logged {
+                    self.next_event_error_logged = true;
 
-        let new_gamepads: Vec<_> = gamepads.flatten().map(Gamepad::new).collect();
-        let mut old_index = 0;
-        let mut new_index = 0;
+                    let exception: DomException = match js.dyn_into() {
+                        Ok(x) => x,
+                        Err(e) => {
+                            error!("getGamepads() failed with unknown error: {:?}", e);
+                            return None;
+                        }
+                    };
+                    error!("getGamepads(): {}", exception.message());
+                }
 
-        loop {
-            match (self.gamepads.get(old_index), new_gamepads.get(new_index)) {
-                (Some(old), Some(new)) if old.gamepad.index() == new.gamepad.index() => {
-                    let index = old.index();
+                return None;
+            }
+        };
+
+        let mut new_gamepads: Vec<_> = gamepads
+            .iter()
+            .map(|val| {
+                if val.is_null() {
+                    None
+                } else {
+                    Some(Gamepad::new(WebGamepad::from(val)))
+                }
+            })
+            .collect();
+        if new_gamepads.len() < self.gamepads.len() {
+            new_gamepads.resize_with(self.gamepads.len(), || None);
+        }
+
+        for (index, new) in new_gamepads.into_iter().enumerate() {
+            match (self.gamepads.get_mut(index), new) {
+                (Some(old), Some(new)) => {
+                    if !old.connected {
+                        self.event_cache
+                            .push_back(Event::new(new.index(), EventType::Connected));
+                    }
 
                     // Compare the two gamepads and generate events
                     let buttons = old.mapping.buttons().zip(new.mapping.buttons()).enumerate();
                     for (btn_index, (old_button, new_button)) in buttons {
                         let ev_code = crate::EvCode(new.button_code(btn_index));
-                        match (old_button, new_button) {
-                            (false, true) => self
-                                .event_cache
-                                .push_back(Event::new(index, EventType::ButtonPressed(ev_code))),
-                            (true, false) => self
-                                .event_cache
-                                .push_back(Event::new(index, EventType::ButtonReleased(ev_code))),
-                            _ => (),
+
+                        if [BTN_LT2, BTN_RT2].contains(&ev_code.0) && old_button.1 != new_button.1 {
+                            // Treat left and right triggers as axes so we get non-binary values.
+                            // Button Pressed/Changed events are generated from the axis changed
+                            // events later.
+                            let value = (new_button.1 * i32::MAX as f64) as i32;
+                            self.event_cache.push_back(Event::new(
+                                index,
+                                EventType::AxisValueChanged(value, ev_code),
+                            ));
+                        } else {
+                            match (old_button.0, new_button.0) {
+                                (false, true) => self.event_cache.push_back(Event::new(
+                                    index,
+                                    EventType::ButtonPressed(ev_code),
+                                )),
+                                (true, false) => self.event_cache.push_back(Event::new(
+                                    index,
+                                    EventType::ButtonReleased(ev_code),
+                                )),
+                                _ => (),
+                            }
                         }
                     }
 
@@ -87,49 +133,39 @@ impl Gilrs {
                     for (axis_index, (old_axis, new_axis)) in axes {
                         if old_axis != new_axis {
                             let ev_code = crate::EvCode(new.axis_code(axis_index));
-                            let value = (new_axis * I32_MAX as f64) as i32;
+                            let value = (new_axis * i32::MAX as f64) as i32;
                             self.event_cache.push_back(Event::new(
                                 index,
                                 EventType::AxisValueChanged(value, ev_code),
                             ));
                         }
                     }
-                    old_index += 1;
-                    new_index += 1;
-                }
-                (Some(old), Some(new)) if old.gamepad.index() > new.gamepad.index() => {
-                    // Create a connected event
-                    self.event_cache
-                        .push_back(Event::new(new.index(), EventType::Connected));
-                    new_index += 1;
-                }
-                (Some(old), Some(_new)) => {
-                    // Create a disconnect event
-                    self.event_cache
-                        .push_back(Event::new(old.index(), EventType::Disconnected));
-                    old_index += 1;
+
+                    *old = new;
                 }
                 (Some(old), None) => {
                     // Create a disconnect event
-                    self.event_cache
-                        .push_back(Event::new(old.index(), EventType::Disconnected));
-                    old_index += 1;
+                    if old.connected {
+                        self.event_cache
+                            .push_back(Event::new(index, EventType::Disconnected));
+                        old.connected = false;
+                    }
                 }
                 (None, Some(new)) => {
                     // Create a connected event
-                    let index = new.index();
                     let event = Event::new(index, EventType::Connected);
                     self.event_cache.push_back(event);
-                    new_index += 1;
+                    self.gamepads.push(new);
                 }
-                (None, None) => {
-                    break;
-                }
+                (None, None) => {}
             }
         }
 
-        self.gamepads = new_gamepads;
         self.event_cache.pop_front()
+    }
+
+    pub(crate) fn next_event_blocking(&mut self, timeout: Option<Duration>) -> Option<Event> {
+        unimplemented!("next_event_blocking is not supported on web. Use next_event.")
     }
 
     pub fn gamepad(&self, id: usize) -> Option<&Gamepad> {
@@ -143,12 +179,18 @@ impl Gilrs {
 
 #[derive(Debug)]
 enum Mapping {
-    Standard { buttons: [bool; 17], axes: [f64; 4] },
-    NoMapping { buttons: Vec<bool>, axes: Vec<f64> },
+    Standard {
+        buttons: [(bool, f64); 17],
+        axes: [f64; 4],
+    },
+    NoMapping {
+        buttons: Vec<(bool, f64)>,
+        axes: Vec<f64>,
+    },
 }
 
 impl Mapping {
-    fn buttons<'a>(&'a self) -> impl Iterator<Item = bool> + 'a {
+    fn buttons(&self) -> impl Iterator<Item = (bool, f64)> + '_ {
         match self {
             Mapping::Standard { buttons, .. } => buttons.iter(),
             Mapping::NoMapping { buttons, .. } => buttons.iter(),
@@ -156,7 +198,7 @@ impl Mapping {
         .cloned()
     }
 
-    fn axes<'a>(&'a self) -> impl Iterator<Item = f64> + 'a {
+    fn axes(&self) -> impl Iterator<Item = f64> + '_ {
         match self {
             Mapping::Standard { axes, .. } => axes.iter(),
             Mapping::NoMapping { axes, .. } => axes.iter(),
@@ -170,45 +212,62 @@ pub struct Gamepad {
     uuid: Uuid,
     gamepad: WebGamepad,
     name: String,
+    vendor: Option<u16>,
+    product: Option<u16>,
     mapping: Mapping,
+    connected: bool,
 }
 
 impl Gamepad {
     fn new(gamepad: WebGamepad) -> Gamepad {
         let name = gamepad.id();
 
+        // This regular expression extracts the vendor and product ID from the gamepad "id".
+        // Firefox:
+        //  054c-05c4-Sony Computer Entertainment Wireless Controller
+        // Chrome:
+        //  Sony Computer Entertainment Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 05c4)
+        let regexp = RegExp::new(
+            r"(?:^([a-f0-9]{4})-([a-f0-9]{4})-)|(?:Vendor: ([a-f0-9]{4}) Product: ([a-f0-9]{4})\)$)",
+            "",
+        );
+        let (vendor, product) = if let Some(matches) = regexp.exec(&name) {
+            let parse_hex = |index| {
+                matches
+                    .get(index)
+                    .as_string()
+                    .and_then(|id| u16::from_str_radix(&id, 16).ok())
+            };
+            (
+                parse_hex(1).or_else(|| parse_hex(3)),
+                parse_hex(2).or_else(|| parse_hex(4)),
+            )
+        } else {
+            (None, None)
+        };
+
         let buttons = gamepad.buttons();
         let button_iter = {
-            #[cfg(feature = "wasm-bindgen")]
             {
                 buttons.iter().map(GamepadButton::from)
-            }
-            #[cfg(not(feature = "wasm-bindgen"))]
-            {
-                buttons.into_iter()
             }
         };
 
         let axes = gamepad.axes();
         let axis_iter = {
-            #[cfg(feature = "wasm-bindgen")]
             {
                 axes.iter()
                     .map(|val| val.as_f64().expect("axes() should be an array of f64"))
-            }
-            #[cfg(not(feature = "wasm-bindgen"))]
-            {
-                axes.into_iter()
             }
         };
 
         let mapping = match gamepad.mapping() {
             GamepadMappingType::Standard => {
-                let mut buttons = [false; 17];
+                let mut buttons = [(false, 0.0); 17];
                 let mut axes = [0.0; 4];
 
                 for (index, button) in button_iter.enumerate().take(buttons.len()) {
-                    buttons[index] = button.pressed();
+                    buttons[index] = (button.pressed(), button.value());
                 }
 
                 for (index, axis) in axis_iter.enumerate().take(axes.len()) {
@@ -218,7 +277,9 @@ impl Gamepad {
                 Mapping::Standard { buttons, axes }
             }
             _ => {
-                let buttons = button_iter.map(|button| button.pressed()).collect();
+                let buttons = button_iter
+                    .map(|button| (button.pressed(), button.value()))
+                    .collect();
                 let axes = axis_iter.collect();
                 Mapping::NoMapping { buttons, axes }
             }
@@ -228,7 +289,10 @@ impl Gamepad {
             uuid: Uuid::nil(),
             gamepad,
             name,
+            vendor,
+            product,
             mapping,
+            connected: true,
         }
     }
 
@@ -246,6 +310,14 @@ impl Gamepad {
 
     pub fn mount_point(&self) -> Option<String> {
         None
+    }
+
+    pub fn vendor_id(&self) -> Option<u16> {
+        self.vendor
+    }
+
+    pub fn product_id(&self) -> Option<u16> {
+        self.product
     }
 
     pub fn is_connected(&self) -> bool {
@@ -275,27 +347,32 @@ impl Gamepad {
     fn button_code(&self, index: usize) -> EvCode {
         self.buttons()
             .get(index)
-            .map(|ev| ev.clone())
+            .copied()
             .unwrap_or(EvCode(index as u8 + 31))
     }
 
     fn axis_code(&self, index: usize) -> EvCode {
         self.axes()
             .get(index)
-            .map(|ev| ev.clone())
-            .unwrap_or(EvCode((index + self.mapping.buttons().count()) as u8 + 31))
+            .copied()
+            .unwrap_or_else(|| EvCode((index + self.mapping.buttons().count()) as u8 + 31))
     }
 
     pub(crate) fn axis_info(&self, _nec: EvCode) -> Option<&AxisInfo> {
+        if self.buttons().contains(&_nec) {
+            return Some(&AxisInfo {
+                min: 0,
+                max: i32::MAX,
+                deadzone: None,
+            });
+        }
         Some(&AxisInfo {
-            min: i32::min_value() as i32,
-            max: i32::max_value() as i32,
+            min: i32::MIN,
+            max: i32::MAX,
             deadzone: None,
         })
     }
 }
-#[cfg(feature = "serde-serialize")]
-use serde::{Deserialize, Serialize};
 
 #[cfg_attr(feature = "serde-serialize", derive(Serialize, Deserialize))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -312,6 +389,21 @@ impl Display for EvCode {
         self.0.fmt(f)
     }
 }
+
+#[derive(Debug, Copy, Clone)]
+enum Error {
+    NoWindow,
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        match *self {
+            Error::NoWindow => f.write_str("window is not available"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub mod native_ev_codes {
     use super::EvCode;
@@ -353,8 +445,8 @@ pub mod native_ev_codes {
     pub(super) static BUTTONS: [EvCode; 17] = [
         BTN_SOUTH,
         BTN_EAST,
-        BTN_NORTH,
         BTN_WEST,
+        BTN_NORTH,
         BTN_LT,
         BTN_RT,
         BTN_LT2,

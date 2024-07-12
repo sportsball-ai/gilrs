@@ -12,51 +12,7 @@ use uuid::Uuid;
 use crate::ev::{Axis, AxisOrBtn, Button};
 
 // Must be sorted!
-static BUTTONS_SDL: [&str; 19] = [
-    "a",
-    "b",
-    "back",
-    "c",
-    "dpdown",
-    "dpleft",
-    "dpright",
-    "dpup",
-    "guide",
-    "leftshoulder",
-    "leftstick",
-    "lefttrigger",
-    "rightshoulder",
-    "rightstick",
-    "righttrigger",
-    "start",
-    "x",
-    "y",
-    "z",
-];
-static BUTTONS: [Button; 19] = [
-    Button::South,
-    Button::East,
-    Button::Select,
-    Button::C,
-    Button::DPadDown,
-    Button::DPadLeft,
-    Button::DPadRight,
-    Button::DPadUp,
-    Button::Mode,
-    Button::LeftTrigger,
-    Button::LeftThumb,
-    Button::LeftTrigger2,
-    Button::RightTrigger,
-    Button::RightThumb,
-    Button::RightTrigger2,
-    Button::Start,
-    Button::West,
-    Button::North,
-    Button::Z,
-];
-
-// Must be sorted!
-static AXES_SDL: [&str; 25] = [
+static AXES_SDL: [&str; 31] = [
     "a",
     "b",
     "back",
@@ -72,6 +28,11 @@ static AXES_SDL: [&str; 25] = [
     "leftx",
     "lefty",
     "leftz",
+    "misc1",
+    "paddle1",
+    "paddle2",
+    "paddle3",
+    "paddle4",
     "rightshoulder",
     "rightstick",
     "righttrigger",
@@ -79,11 +40,12 @@ static AXES_SDL: [&str; 25] = [
     "righty",
     "rightz",
     "start",
+    "touchpad",
     "x",
     "y",
     "z",
 ];
-static AXES: [AxisOrBtn; 25] = [
+static AXES: [AxisOrBtn; 31] = [
     AxisOrBtn::Btn(Button::South),
     AxisOrBtn::Btn(Button::East),
     AxisOrBtn::Btn(Button::Select),
@@ -99,6 +61,11 @@ static AXES: [AxisOrBtn; 25] = [
     AxisOrBtn::Axis(Axis::LeftStickX),
     AxisOrBtn::Axis(Axis::LeftStickY),
     AxisOrBtn::Axis(Axis::LeftZ),
+    AxisOrBtn::Btn(Button::Unknown),
+    AxisOrBtn::Btn(Button::Unknown),
+    AxisOrBtn::Btn(Button::Unknown),
+    AxisOrBtn::Btn(Button::Unknown),
+    AxisOrBtn::Btn(Button::Unknown),
     AxisOrBtn::Btn(Button::RightTrigger),
     AxisOrBtn::Btn(Button::RightThumb),
     AxisOrBtn::Btn(Button::RightTrigger2),
@@ -106,6 +73,7 @@ static AXES: [AxisOrBtn; 25] = [
     AxisOrBtn::Axis(Axis::RightStickY),
     AxisOrBtn::Axis(Axis::RightZ),
     AxisOrBtn::Btn(Button::Start),
+    AxisOrBtn::Btn(Button::Unknown),
     AxisOrBtn::Btn(Button::West),
     AxisOrBtn::Btn(Button::North),
     AxisOrBtn::Btn(Button::Z),
@@ -141,9 +109,14 @@ impl<'a> Parser<'a> {
 
     fn parse_uuid(&mut self) -> Result<Token<'_>, Error> {
         let next_comma = self.next_comma_or_end();
-        let uuid = Uuid::parse_str(&self.data[self.pos..next_comma])
-            .map(Token::Uuid)
-            .or_else(|_| Err(Error::new(ErrorKind::InvalidGuid, self.pos)));
+        let uuid_field = &self.data[self.pos..next_comma];
+        let uuid = if uuid_field == "xinput" {
+            Ok(Token::Uuid(Uuid::nil()))
+        } else {
+            Uuid::parse_str(uuid_field)
+                .map(Token::Uuid)
+                .map_err(|_| Error::new(ErrorKind::InvalidGuid, self.pos))
+        };
 
         if uuid.is_err() {
             self.state = State::Invalid;
@@ -200,6 +173,18 @@ impl<'a> Parser<'a> {
         let mut inverted = false;
         let mut is_axis = false;
 
+        let key = match key.get(0..1) {
+            Some("+") => {
+                output = AxisRange::UpperHalf;
+                &key[1..]
+            }
+            Some("-") => {
+                output = AxisRange::LowerHalf;
+                &key[1..]
+            }
+            _ => key,
+        };
+
         let from = match value.get(0..1) {
             Some("+") if value.get(1..2) == Some("a") => {
                 is_axis = true;
@@ -243,45 +228,32 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| Error::new(ErrorKind::InvalidValue, pos))?;
                 let hat = value[1..dot_idx]
                     .parse()
-                    .or_else(|_| Err(Error::new(ErrorKind::InvalidValue, pos + 1)))?;
+                    .map_err(|_| Error::new(ErrorKind::InvalidValue, pos + 1))?;
                 let direction = value
-                    .get((dot_idx as usize + 1)..)
+                    .get((dot_idx + 1)..)
                     .and_then(|s| s.parse().ok())
                     .ok_or_else(|| Error::new(ErrorKind::InvalidValue, pos + dot_idx + 1))?;
 
-                let idx = BUTTONS_SDL
+                let idx = AXES_SDL
                     .binary_search(&key)
-                    .or_else(|_| Err(Error::new(ErrorKind::UnknownButton, pos)))?;
+                    .map_err(|_| Error::new(ErrorKind::UnknownButton, pos))?;
 
                 return Ok(Token::HatMapping {
                     hat,
                     direction,
-                    to: BUTTONS[idx],
+                    to: AXES[idx],
+                    output,
                 });
             }
             _ => return Err(Error::new(ErrorKind::InvalidValue, pos)),
         }
         .parse::<u16>()
-        .or_else(|_| Err(Error::new(ErrorKind::InvalidValue, pos)))?;
+        .map_err(|_| Error::new(ErrorKind::InvalidValue, pos))?;
 
         if is_axis {
-            let key = match key.get(0..1) {
-                Some("+") => {
-                    output = AxisRange::UpperHalf;
-
-                    &key[1..]
-                }
-                Some("-") => {
-                    output = AxisRange::LowerHalf;
-
-                    &key[1..]
-                }
-                _ => key,
-            };
-
             let idx = AXES_SDL
                 .binary_search(&key)
-                .or_else(|_| Err(Error::new(ErrorKind::UnknownAxis, pos)))?;
+                .map_err(|_| Error::new(ErrorKind::UnknownAxis, pos))?;
 
             Ok(Token::AxisMapping {
                 from,
@@ -291,13 +263,14 @@ impl<'a> Parser<'a> {
                 inverted,
             })
         } else {
-            let idx = BUTTONS_SDL
+            let idx = AXES_SDL
                 .binary_search(&key)
-                .or_else(|_| Err(Error::new(ErrorKind::UnknownButton, pos)))?;
+                .map_err(|_| Error::new(ErrorKind::UnknownButton, pos))?;
 
             Ok(Token::ButtonMapping {
                 from,
-                to: BUTTONS[idx],
+                to: AXES[idx],
+                output,
             })
         }
     }
@@ -310,6 +283,7 @@ impl<'a> Parser<'a> {
     }
 }
 
+#[derive(Debug)]
 pub enum Token<'a> {
     Uuid(Uuid),
     Platform(&'a str),
@@ -323,18 +297,21 @@ pub enum Token<'a> {
     },
     ButtonMapping {
         from: u16,
-        to: Button,
+        to: AxisOrBtn,
+        output: AxisRange,
     },
     // This is just SDL representation, we will convert this to axis mapping later
     HatMapping {
         hat: u16,
         // ?
         direction: u16,
-        to: Button,
+        to: AxisOrBtn,
+        output: AxisRange,
     },
 }
 
 #[repr(u8)]
+#[derive(Debug)]
 pub enum AxisRange {
     LowerHalf,
     UpperHalf,
@@ -349,9 +326,9 @@ enum State {
     Invalid,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
-    position: usize,
+    pub(crate) position: usize,
     kind: ErrorKind,
 }
 
@@ -365,7 +342,7 @@ impl Error {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorKind {
     InvalidGuid,
     InvalidKeyValPair,
@@ -393,5 +370,48 @@ impl Display for Error {
         };
 
         f.write_fmt(format_args!("{} at {}", s, self.position))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mapping::parser::{ErrorKind, Parser};
+    use crate::utils::PATH_SEPARATOR;
+
+    #[test]
+    fn test_all_sdl_mappings_for_parse_errors() {
+        let included_mappings = include_str!(concat!(
+            env!("OUT_DIR"),
+            PATH_SEPARATOR!(),
+            "gamecontrollerdb.txt"
+        ))
+        .lines();
+
+        let mut errors = 0;
+        let mut index = 0;
+        for line in included_mappings {
+            let mut parser = Parser::new(line);
+
+            while let Some(token) = parser.next_token() {
+                if let Err(ref e) = token {
+                    if e.kind() != &ErrorKind::EmptyValue {
+                        errors += 1;
+                        println!("{:?}", e);
+                        println!(
+                            "{}: {} (...) {}\n",
+                            index,
+                            line.chars().take(50).collect::<String>(),
+                            line.chars().skip(e.position).take(15).collect::<String>()
+                        );
+
+                        if e.kind() == &ErrorKind::InvalidParserState {
+                            break;
+                        }
+                    }
+                }
+                index += 1;
+            }
+        }
+        assert_eq!(errors, 0);
     }
 }
